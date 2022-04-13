@@ -1,52 +1,29 @@
-/*
- * Copyright (c) 2022 Thomas Stuefe. All rights reserved.
- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
- *
- * This code is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 only, as
- * published by the Free Software Foundation.
- *
- * This code is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * version 2 for more details (a copy is included in the LICENSE file that
- * accompanied this code).
- *
- * You should have received a copy of the GNU General Public License version
- * 2 along with this work; if not, write to the Free Software Foundation,
- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
- *
- */
-
-
-
-#include <assert.h>
 #include <sys/types.h>
+#include <sys/prctl.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <wait.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <string.h>
-#include <errno.h>
+#include <time.h>
 #include <unistd.h>
-#include <sys/prctl.h>
-
+#include <wait.h>
 
 static int verbose = 0;
-static int fault_tolerant = 0;
-static int dont_reap = 0;
+static int wait_for_all_children = 0;
+static int terminate_all_children_after_command_terminated = 0;
 
-// This defines how long the process should run:
-// per default we terminate when the direct child (the command we spawned) terminates
-// if -w, we wait until all sub processes quit, which includes the command
-// if -W, we wait forever
-static int wait_for_all_sub_processes = 0;
-static int wait_forever = 0;
+// How much time we give children to terminate before terminating ourselves.
+static const int shutdown_timeout_seconds = 5;
 
-static void LOG(const char* msg) {
-	printf("%s\n", msg);
-	fflush(stdout);
-}
+static pid_t command_pid = -1;
+
+////////////////// logging        ////////////////////////////////////
+
+// Note: LOG is signal safe, LOGf is not.
+#define WRITE_LITERAL_STRING(s) 	{ write(STDOUT_FILENO, s, sizeof(s)); } 
+#define LOG(msg)  					WRITE_LITERAL_STRING(msg "\n")
 
 static void LOGf(const char* fmt, ...) {
 	va_list ap;
@@ -62,38 +39,153 @@ static void LOGf(const char* fmt, ...) {
 
 static void print_usage() {
 	LOG("Usage: little-reaper [options] <command> [<command arguments> ...]");
-	LOG("       options:");
-	LOG("       -v: verbose mode");
-	LOG("       -f: fault tolerant mode");
-	LOG("       -w: Wait for all child processes (default: only wait for command)");
-	LOG("       -W: Wait forever, never finish");
-	LOG("       -r: Dont reap child processes");
+	LOG(" little-reaper will make itself reaper for all child processes, and");
+	LOG(" make itself process group leader. It then will start <command> as sub");
+	LOG(" process.");
+	LOG(" While <command> is running, it will adopt any orphaned child processes");
+	LOG(" and reap them if they terminate. After <command> is finished, it will");
+	LOG(" optionally terminate any remaining orphans, then exit.");
+	LOG(" If little-reaper gets terminated via SIGTERM or SIGINT, it will terminate");
+	LOG(" all child processes, including <command> itself, then exit.");
+	LOG("Options:");
+	LOG(" -v: verbose mode");
+	LOG(" -w: wait for all childs to terminate before exiting.");	
+	LOG(" -t: terminate remaining child processes after <command> terminates.");		
 }
+
+// Simple utility function to print an unsigned integer in signal safe fashion
+static void write_num(unsigned n) {
+	int a = n;
+	if (n > 9) {
+		write_num(n/10);
+	}
+	const char* const digits = "0123456789";
+	write(STDOUT_FILENO, digits + (a % 10), 1);
+}
+
+// Simple utility function to log, in a signal safe fashion, the exit state of a process
+static void LOG_process_state(pid_t pid, int status) {
+	if (pid > 0) {
+		if (WIFEXITED(status)) {
+			WRITE_LITERAL_STRING("child ");
+			write_num((unsigned)pid);
+			WRITE_LITERAL_STRING(" exited with ");
+			write_num((unsigned)WEXITSTATUS(status));
+			WRITE_LITERAL_STRING("\n");
+		} else if (WIFSIGNALED(status)) {
+			WRITE_LITERAL_STRING("child ");
+			write_num((unsigned)pid);
+			WRITE_LITERAL_STRING(" terminated with ");
+			write_num((unsigned)WTERMSIG(status));
+			WRITE_LITERAL_STRING("\n");
+		}
+	}
+}
+
+
+////////////////// Child handling ////////////////////////////////////
+
+// Note: there are two strategies for this
+// 1) let the direct child open up a new process group, then send a signal to
+//    that process group. That only works reliably as long as the direct child 
+//    is alive. This is because if it died, we have no guarantee that anyone
+//    in that group is still alive. The process group may have been empty and
+//    the process group id may have been reused. Astronomically unlikely, but
+//    still possible.
+// 2) Make yourself leader of a process group. Then send signals to that process
+//    group. That also works if the direct child process terminated, but will
+//    require us to filter, in our signal handler, the case where the signal
+//    was sent by myself to myself.
+//
+// (1) does not allow to terminate orphans we adopted after the <command> terminated.
+// (2) does allow that, but is a bit more work. We do (2) here.
+static void send_signal_to_all_children(int sig) {
+	if (getpgrp() == getpid()) { // sanity check, am I really process group leader?
+		kill(0, sig);
+	}
+}
+
+////////////////// signal handling ////////////////////////////////////
+
+static volatile sig_atomic_t shutdown_in_progress = 0;
+static int shutdown_signal = -1;
+
+// Note: called from signal handler.
+static void handle_shutdown_signal(int sig) {
+	if (!shutdown_in_progress) {
+		shutdown_in_progress = 1;
+		shutdown_signal = sig;
+
+		// send SIGTERM to all kids, then start the death clock.
+		LOG("Terminating children...");
+		send_signal_to_all_children(SIGTERM);
+		VERBOSE("tick tock...");
+		alarm(shutdown_timeout_seconds);
+	} else {
+		VERBOSE("shutdown in progress, ignoring further attempts.");
+	}
+}
+
+// Note: called from signal handler.
+static void handle_alarm() {
+	// We receive this signal because we set the alarm after getting
+	// a termination request, and we timeouted. So here we exit
+	// right away.
+	if (shutdown_in_progress) {
+		LOG("Shutdown timeout. Terminating.");
+		exit(-1);
+	}
+}
+
+static void signal_handler(int sig, siginfo_t* siginfo, void* context) {
+
+	// Ignore SIGTERM send by myself to myself (see send_signal_to_all_children)
+	if (sig == SIGTERM && siginfo->si_pid == getpid()) {
+		VERBOSE("Ignoring SIGTERM sent by myself.");
+		return;
+	}
+	
+	WRITE_LITERAL_STRING("Signal: ");
+	write_num(sig);
+	WRITE_LITERAL_STRING("\n");
+
+	switch (sig) {
+		case SIGTERM:
+		case SIGINT:
+			handle_shutdown_signal(sig);
+			break;
+		case SIGALRM:
+			handle_alarm();
+			break;			
+	}
+}
+
+static void initialize_signal_handler() {
+	struct sigaction sa;
+	sa.sa_sigaction = signal_handler;
+	sigemptyset(&(sa.sa_mask));
+	sa.sa_flags = SA_SIGINFO;
+	const int sigs[] = { SIGTERM, SIGINT, SIGALRM, -1 };
+	for (int i = 0; sigs[i] != -1; i ++) {
+		if (sigaction(sigs[i], &sa, NULL) == -1) {
+			LOGf("Failed to install signal handler for %d - errno: %d (%s)",
+			     sigs[i], errno, strerror(errno));
+		}
+	}
+}
+
+////////////////// misc stuff ////////////////////////////////////
 
 // Make process a sub reaper for all direct and indirect children
 static void make_me_a_reaper() {
 	int rc = prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
 	if (rc == -1) {
 		LOGf("Failed to set sub reaper state - errno: %d (%s)", errno, strerror(errno));
-		if (!fault_tolerant) {
-			exit(-1);
-		}
+		LOG("Note: Will not adopt orphans.");
 	}
 }
 
-static int return_code_from_process_status(int status) {
-	if (WIFSIGNALED(status)) {
-		return -1;
-	} else if (WIFEXITED(status)) {
-		return WEXITSTATUS(status);
-	}
-	return -1;
-}
-
-static void infinite_sleep() {
-	VERBOSE("sleeping forever...");
-	for (;;) sleep(10);
-}
+////////////////// main ////////////////////////////////////
 
 int main(int argc, char** argv) {
 	
@@ -113,17 +205,11 @@ int main(int argc, char** argv) {
 				case 'v': 
 					verbose = 1;
 					break;
-				case 'e':
-					fault_tolerant = 1;
+				case 'w': 
+					wait_for_all_children = 1;
 					break;
-				case 'w':
-					wait_for_all_sub_processes = 1;
-					break;
-				case 'W':
-					wait_forever = 1;
-					break;
-				case 'r':
-					dont_reap = 1;
+				case 't': 
+					terminate_all_children_after_command_terminated = 1;
 					break;
 				default: 
 					LOGf("Unknown flag: %c", argv[i][letter]);
@@ -142,9 +228,15 @@ int main(int argc, char** argv) {
 		exit(-1);
 	}
 
-	// Make process a sub reaper
-	make_me_a_reaper();
+	// Make me process group leader
+	setpgrp();
 
+	// Make us subreaper
+	make_me_a_reaper();
+	
+	// Init handler to handle SIGTERM and SIGINT
+	initialize_signal_handler();
+	
 	// assemble NULL-terminated argument vector for exec
 	int child_argc = argc - start_command;
 	char** child_argv = (char**) malloc((child_argc + 1) * sizeof(char*));
@@ -153,15 +245,13 @@ int main(int argc, char** argv) {
 	}
 	child_argv[child_argc] = NULL;
 
-	VERBOSEf("little-reaper (pid: %d, parent: %d)", getpid(), getppid());
-//	for (int i = 0; child_argv[i] != NULL; i ++) {
-//		VERBOSEf("argv[%d]: \"%s\"", i, child_argv[i]);
-//	}
+	VERBOSEf("little-reaper (pid: %d, parent: %d, pgrp: %d)", getpid(), getppid(), getpgrp());
 
-	// fork, then exec the child process
-	pid_t command = fork();
+	// fork, then exec <command>
+	command_pid = fork();
 
-	if (command == 0) {
+	if (command_pid == 0) {
+		// --- Child ---
 		int rc = execv(child_argv[0], child_argv);
 		if (rc == -1) {
 			LOGf("Failed to exec \"%s\" - errno: %d (%s)",
@@ -169,62 +259,39 @@ int main(int argc, char** argv) {
 			exit(-1);
 		}
 	} else {
-
-		// If we were asked not to reap, we cannot wait; we either wait forever or quit immediately.
-		if (dont_reap) {
-			if (wait_forever) {
-				infinite_sleep();
-			}
-			exit(0);
-		}
-
+		// --- Parent ---
 		int command_status = 0;
-		int command_terminated = 0;
-		int no_child_left = 0;
 		for (;;) {
 			int status;
 			pid_t child = wait(&status);
 			if (child > 0) {
-				if (WIFEXITED(status) || WIFSIGNALED(status)) {
-					if (WIFEXITED(status)) {
-						VERBOSEf("child %d exited with %d", child, WEXITSTATUS(status));
+				LOG_process_state(child, status);
+				if (child == command_pid) {
+					VERBOSEf("%s finished.", child_argv[0]);
+					command_status = status;
+					// The command finishes. Handle -t and -w:
+					// -t: we now send SIGTERM to all remaining children (orphans still running)
+					// -w: we wait for all children to exit before exiting ourselves.
+					if (terminate_all_children_after_command_terminated) {
+						send_signal_to_all_children(SIGTERM);
 					}
-					if (WIFSIGNALED(status)) {
-						VERBOSEf("child %d terminated with signal %d", child, WTERMSIG(status));
-					}
-					if (child == command) {
-						VERBOSE("Command finished.");
-						command_status = status;
-						command_terminated = 1;
-					}
-				}
-			} else {
-				if (errno == ECHILD) {
-					no_child_left = 1;
-					VERBOSE("All child processes finished");
-				} else {
-					VERBOSEf("wait error (%d %s)", errno, strerror(errno));
-				}
-			}
-
-			if (wait_forever) {
-				if (no_child_left) {
-					infinite_sleep();
-				}
-			} else {
-				if (wait_for_all_sub_processes) {
-					if (no_child_left) {
-						assert(command_terminated);
-						exit(return_code_from_process_status(command_status));
-					}
-				} else {
-					if (command_terminated) {
-						exit(return_code_from_process_status(command_status));
+					if (!wait_for_all_children) {
+						break;
 					}
 				}
+			} else if (child == (pid_t) -1 && errno == ECHILD) {
+				VERBOSE("all child processes terminated.");
+				break;
 			}
 		}
+
+		// We return -1 if <command> was terminated by signal, or if its exit status was != 0
+		int rc = ((WIFEXITED(command_status) && WEXITSTATUS(command_status) != 0) || 
+		           WIFSIGNALED(command_status)) ? -1 : 0;
+		VERBOSEf("Returning %d", rc);
+
+		exit(rc);
 	}
-	
+
 	return 0;
 }
