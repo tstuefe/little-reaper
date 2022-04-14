@@ -1,5 +1,5 @@
-little-reaper: little-reaper.c
-	cc -o little-reaper little-reaper.c
+little-reaper: tinyreaper.c
+	cc -o tinyreaper tinyreaper.c
 clean :
-	rm little-reaper 
+	rm tinyreaper 
 

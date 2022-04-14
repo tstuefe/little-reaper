@@ -12,7 +12,7 @@
 
 static int verbose = 0;
 static int wait_for_all_children = 0;
-static int terminate_all_children_after_command_terminated = 0;
+static int terminate_orphans = 0;
 
 // How much time we give children to terminate before terminating ourselves.
 static const int shutdown_timeout_seconds = 5;
@@ -23,9 +23,10 @@ static pid_t command_pid = -1;
 
 // Note: LOG is signal safe, LOGf is not.
 #define WRITE_LITERAL_STRING(s) 	{ write(STDOUT_FILENO, s, sizeof(s)); } 
-#define LOG(msg)  					WRITE_LITERAL_STRING(msg "\n")
+#define LOG(msg)  					WRITE_LITERAL_STRING("tinyreaper: " msg "\n")
 
 static void LOGf(const char* fmt, ...) {
+	WRITE_LITERAL_STRING("tinyreaper: ");
 	va_list ap;
 	va_start(ap, fmt);
 	vprintf(fmt, ap);
@@ -38,22 +39,17 @@ static void LOGf(const char* fmt, ...) {
 #define VERBOSE(msg) 		if (verbose) { LOG(msg); }
 
 static void print_usage() {
-	LOG("Usage: little-reaper [options] <command> [<command arguments> ...]");
-	LOG(" little-reaper will make itself reaper for all child processes, and");
-	LOG(" make itself process group leader. It then will start <command> as sub");
-	LOG(" process.");
-	LOG(" While <command> is running, it will adopt any orphaned child processes");
-	LOG(" and reap them if they terminate. After <command> is finished, it will");
-	LOG(" optionally terminate any remaining orphans, then exit.");
-	LOG(" If little-reaper gets terminated via SIGTERM or SIGINT, it will terminate");
-	LOG(" all child processes, including <command> itself, then exit.");
-	LOG("Options:");
-	LOG(" -v: verbose mode");
-	LOG(" -w: wait for all childs to terminate before exiting.");	
-	LOG(" -t: terminate remaining child processes after <command> terminates.");		
+	printf("tinyreaper [Options] <command> [<command arguments>]\n");
+	printf("\n");
+	printf("Registers itself as sub reaper for child processes, then starts <command>.\n");
+	printf("\n");
+	printf("Options:\n");
+    printf("`-v`: verbose mode\n");
+    printf("`-w`: wait for all orphans to terminate after <command> exits\n");
+    printf("`-t`: terminate orphans after <command> exits\n");
 }
 
-// Simple utility function to print an unsigned integer in signal safe fashion
+// Signal safe writing of a decimal number
 static void write_num(unsigned n) {
 	int a = n;
 	if (n > 9) {
@@ -63,7 +59,7 @@ static void write_num(unsigned n) {
 	write(STDOUT_FILENO, digits + (a % 10), 1);
 }
 
-// Simple utility function to log, in a signal safe fashion, the exit state of a process
+// Signal safe logging of process exit status
 static void LOG_process_state(pid_t pid, int status) {
 	if (pid > 0) {
 		if (WIFEXITED(status)) {
@@ -85,21 +81,9 @@ static void LOG_process_state(pid_t pid, int status) {
 
 ////////////////// Child handling ////////////////////////////////////
 
-// Note: there are two strategies for this
-// 1) let the direct child open up a new process group, then send a signal to
-//    that process group. That only works reliably as long as the direct child 
-//    is alive. This is because if it died, we have no guarantee that anyone
-//    in that group is still alive. The process group may have been empty and
-//    the process group id may have been reused. Astronomically unlikely, but
-//    still possible.
-// 2) Make yourself leader of a process group. Then send signals to that process
-//    group. That also works if the direct child process terminated, but will
-//    require us to filter, in our signal handler, the case where the signal
-//    was sent by myself to myself.
-//
-// (1) does not allow to terminate orphans we adopted after the <command> terminated.
-// (2) does allow that, but is a bit more work. We do (2) here.
 static void send_signal_to_all_children(int sig) {
+	// We send a signal to the process group, which includes ourselves.
+	// We filter out signals from ourselves in the signal handler.
 	if (getpgrp() == getpid()) { // sanity check, am I really process group leader?
 		kill(0, sig);
 	}
@@ -107,18 +91,17 @@ static void send_signal_to_all_children(int sig) {
 
 ////////////////// signal handling ////////////////////////////////////
 
-static volatile sig_atomic_t shutdown_in_progress = 0;
-static int shutdown_signal = -1;
+static volatile sig_atomic_t received_termination_request = 0;
 
 // Note: called from signal handler.
-static void handle_shutdown_signal(int sig) {
-	if (!shutdown_in_progress) {
-		shutdown_in_progress = 1;
-		shutdown_signal = sig;
+static void handle_termination_signal(int sig) {
+	if (!received_termination_request) {
+	 	received_termination_request = 1;
 
 		// send SIGTERM to all kids, then start the death clock.
 		LOG("Terminating children...");
 		send_signal_to_all_children(SIGTERM);
+
 		VERBOSE("tick tock...");
 		alarm(shutdown_timeout_seconds);
 	} else {
@@ -131,7 +114,7 @@ static void handle_alarm() {
 	// We receive this signal because we set the alarm after getting
 	// a termination request, and we timeouted. So here we exit
 	// right away.
-	if (shutdown_in_progress) {
+	if  (received_termination_request) {
 		LOG("Shutdown timeout. Terminating.");
 		exit(-1);
 	}
@@ -145,14 +128,17 @@ static void signal_handler(int sig, siginfo_t* siginfo, void* context) {
 		return;
 	}
 	
-	WRITE_LITERAL_STRING("Signal: ");
-	write_num(sig);
-	WRITE_LITERAL_STRING("\n");
+	if (verbose) {
+		WRITE_LITERAL_STRING("Signal: ");
+		write_num(sig);
+		WRITE_LITERAL_STRING("\n");
+	}
 
 	switch (sig) {
 		case SIGTERM:
 		case SIGINT:
-			handle_shutdown_signal(sig);
+		case SIGQUIT:
+			handle_termination_signal(sig);
 			break;
 		case SIGALRM:
 			handle_alarm();
@@ -165,7 +151,7 @@ static void initialize_signal_handler() {
 	sa.sa_sigaction = signal_handler;
 	sigemptyset(&(sa.sa_mask));
 	sa.sa_flags = SA_SIGINFO;
-	const int sigs[] = { SIGTERM, SIGINT, SIGALRM, -1 };
+	const int sigs[] = { SIGTERM, SIGINT, SIGQUIT, SIGALRM, -1 };
 	for (int i = 0; sigs[i] != -1; i ++) {
 		if (sigaction(sigs[i], &sa, NULL) == -1) {
 			LOGf("Failed to install signal handler for %d - errno: %d (%s)",
@@ -209,7 +195,7 @@ int main(int argc, char** argv) {
 					wait_for_all_children = 1;
 					break;
 				case 't': 
-					terminate_all_children_after_command_terminated = 1;
+					terminate_orphans = 1;
 					break;
 				default: 
 					LOGf("Unknown flag: %c", argv[i][letter]);
@@ -245,7 +231,7 @@ int main(int argc, char** argv) {
 	}
 	child_argv[child_argc] = NULL;
 
-	VERBOSEf("little-reaper (pid: %d, parent: %d, pgrp: %d)", getpid(), getppid(), getpgrp());
+	VERBOSEf("tinyreaper (pid: %d, parent: %d, pgrp: %d)", getpid(), getppid(), getpgrp());
 
 	// fork, then exec <command>
 	command_pid = fork();
@@ -272,7 +258,7 @@ int main(int argc, char** argv) {
 					// The command finishes. Handle -t and -w:
 					// -t: we now send SIGTERM to all remaining children (orphans still running)
 					// -w: we wait for all children to exit before exiting ourselves.
-					if (terminate_all_children_after_command_terminated) {
+					if (terminate_orphans) {
 						send_signal_to_all_children(SIGTERM);
 					}
 					if (!wait_for_all_children) {
