@@ -11,8 +11,6 @@
 #include <wait.h>
 
 static int verbose = 0;
-static int wait_for_all_children = 0;
-static int terminate_orphans = 0;
 
 // How much time we give children to terminate before terminating ourselves.
 static const int shutdown_timeout_seconds = 5;
@@ -45,8 +43,6 @@ static void print_usage() {
 	printf("\n");
 	printf("Options:\n");
     printf("`-v`: verbose mode\n");
-    printf("`-w`: wait for all orphans to terminate after <command> exits\n");
-    printf("`-t`: terminate orphans after <command> exits\n");
 }
 
 // Signal safe writing of a decimal number
@@ -91,22 +87,20 @@ static void send_signal_to_all_children(int sig) {
 
 ////////////////// signal handling ////////////////////////////////////
 
-static volatile sig_atomic_t received_termination_request = 0;
+static volatile sig_atomic_t shutdown_in_progress = 0;
 
-// Note: called from signal handler.
-static void handle_termination_signal(int sig) {
-	if (!received_termination_request) {
-	 	received_termination_request = 1;
-
-		// send SIGTERM to all kids, then start the death clock.
-		LOG("Terminating children...");
-		send_signal_to_all_children(SIGTERM);
-
-		VERBOSE("tick tock...");
-		alarm(shutdown_timeout_seconds);
-	} else {
-		VERBOSE("shutdown in progress, ignoring further attempts.");
+static void start_shutdown() {
+	if (shutdown_in_progress) {
+		VERBOSE("Shutdown already in progress.");
+		return;
 	}
+	shutdown_in_progress = 1;
+	// send SIGTERM to all kids, then start the death clock.
+	LOG("Terminating children...");
+	send_signal_to_all_children(SIGTERM);
+
+	VERBOSE("tick tock...");
+	alarm(shutdown_timeout_seconds);
 }
 
 // Note: called from signal handler.
@@ -114,7 +108,7 @@ static void handle_alarm() {
 	// We receive this signal because we set the alarm after getting
 	// a termination request, and we timeouted. So here we exit
 	// right away.
-	if  (received_termination_request) {
+	if  (shutdown_in_progress) {
 		LOG("Shutdown timeout. Terminating.");
 		exit(-1);
 	}
@@ -138,7 +132,7 @@ static void signal_handler(int sig, siginfo_t* siginfo, void* context) {
 		case SIGTERM:
 		case SIGINT:
 		case SIGQUIT:
-			handle_termination_signal(sig);
+			start_shutdown();
 			break;
 		case SIGALRM:
 			handle_alarm();
@@ -190,12 +184,6 @@ int main(int argc, char** argv) {
 				switch (argv[i][letter]) {
 				case 'v': 
 					verbose = 1;
-					break;
-				case 'w': 
-					wait_for_all_children = 1;
-					break;
-				case 't': 
-					terminate_orphans = 1;
 					break;
 				default: 
 					LOGf("Unknown flag: %c", argv[i][letter]);
@@ -255,15 +243,13 @@ int main(int argc, char** argv) {
 				if (child == command_pid) {
 					VERBOSEf("%s finished.", child_argv[0]);
 					command_status = status;
-					// The command finishes. Handle -t and -w:
-					// -t: we now send SIGTERM to all remaining children (orphans still running)
-					// -w: we wait for all children to exit before exiting ourselves.
-					if (terminate_orphans) {
-						send_signal_to_all_children(SIGTERM);
-					}
-					if (!wait_for_all_children) {
-						break;
-					}
+					// The command finished.
+					// We now terminate any remaining children and continue to wait
+					// until they finish too. We also set a death clock. If all children
+					// finish in time, or if there are no remaining children, we will leave
+					// the loop and exit. If children remain, we will eventually run out of
+					// time and terminate ourselves.
+					start_shutdown();
 				}
 			} else if (child == (pid_t) -1 && errno == ECHILD) {
 				VERBOSE("all child processes terminated.");
