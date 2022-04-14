@@ -10,6 +10,9 @@
 #include <unistd.h>
 #include <wait.h>
 
+
+#define VERSION "1.0.1"
+
 static int verbose = 0;
 
 // How much time we give children to terminate before terminating ourselves.
@@ -43,6 +46,8 @@ static void print_usage() {
 	printf("\n");
 	printf("Options:\n");
     printf("`-v`: verbose mode\n");
+	printf("`-V`: version\n");
+	printf("`-h`: this help\n");
 }
 
 // Signal safe writing of a decimal number
@@ -184,6 +189,14 @@ int main(int argc, char** argv) {
 				switch (argv[i][letter]) {
 				case 'v': 
 					verbose = 1;
+					break;
+				case 'V': 
+					LOG("version: " VERSION);
+					exit(0);
+					break;
+				case 'h': 
+					print_usage();
+					exit(0);
 					break;
 				default: 
 					LOGf("Unknown flag: %c", argv[i][letter]);
