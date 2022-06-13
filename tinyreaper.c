@@ -8,7 +8,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
-#include <wait.h>
+#include <sys/wait.h>
 
 
 #define VERSION "1.0.1"
